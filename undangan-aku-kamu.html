@@ -1,0 +1,896 @@
+<!DOCTYPE html>
+<html lang="id" style="--pri: #c9a45c; --bg: #fbf7f4; --txt: #3a2c33;"><head>
+    <script>
+      (function() {
+        // Capture host references before any artifact code runs: Window.parent
+        // is [Replaceable] (a top-level `var parent` in artifact code would
+        // replace the accessor with a data property), and a top-level
+        // `const crypto` would shadow the global — either would otherwise
+        // silently break the bridge for artifacts that worked before.
+        const realParent = window.parent;
+        const downloadTarget = '/';
+        const cryptoObj = window.crypto;
+        const RealURL = URL;
+        const realDecodeURIComponent = decodeURIComponent;
+        const RealTextEncoder = TextEncoder;
+        const realAtob = atob;
+        const realHistory = window.history;
+        const RealHashChangeEvent = window.HashChangeEvent;
+        const realDispatchEvent = window.dispatchEvent.bind(window);
+        // html-to-image is only used by takeScreenshot: fetched on first use, not as a
+        // parser-blocking tag. Native fetch, captured before the proxy override below.
+        const realFetch = typeof window.fetch === 'function' ? window.fetch.bind(window) : null;
+        const HTML_TO_IMAGE_SRC = "https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js";
+        const HTML_TO_IMAGE_INTEGRITY = "sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==";
+        let htmlToImageLoad = null;
+        const loadHtmlToImage = () => {
+          if (!htmlToImageLoad) {
+            htmlToImageLoad = (realFetch
+              ? realFetch(HTML_TO_IMAGE_SRC, { integrity: HTML_TO_IMAGE_INTEGRITY, credentials: 'omit', referrerPolicy: 'no-referrer' })
+              : Promise.reject(new Error('fetch unavailable'))
+            )
+              .then((res) => {
+                if (!res.ok) throw new Error('html-to-image failed to load (' + res.status + ')');
+                return res.text();
+              })
+              .then((source) => {
+                // UMD bundle: hide the artifact's AMD/CommonJS globals so it takes the
+                // window-global branch; inline script text runs synchronously on insert.
+                const hidden = ['define', 'module', 'exports'].map((k) => {
+                  const entry = { k, own: Object.prototype.hasOwnProperty.call(window, k), v: window[k] };
+                  try { window[k] = undefined; } catch (e) {}
+                  return entry;
+                });
+                try {
+                  const el = document.createElement('script');
+                  el.text = source;
+                  (document.head || document.documentElement).appendChild(el);
+                } finally {
+                  hidden.forEach(({ k, own, v }) => {
+                    try { if (own) { window[k] = v; } else { delete window[k]; } } catch (e) {}
+                  });
+                }
+                if (!window.htmlToImage) throw new Error('html-to-image unavailable after load');
+                return window.htmlToImage;
+              });
+            // A failed load may be transient; let the next screenshot retry.
+            htmlToImageLoad.catch(() => { htmlToImageLoad = null; });
+          }
+          return htmlToImageLoad;
+        };
+        // crypto.randomUUID exists only in Secure Contexts; fall back to a
+        // unique non-crypto id elsewhere (http://LAN-IP dev flows) —
+        // uniqueness is what the bridge needs, unpredictability is
+        // defense-in-depth on top of the source guards.
+        const newRequestId =
+          cryptoObj && typeof cryptoObj.randomUUID === "function"
+            ? function () { return cryptoObj.randomUUID(); }
+            : function () { return Date.now() + "-" + Math.random(); };
+
+        // Bridge request ids are crypto-random (not sequential) so they
+        // cannot be predicted by other frames in the tab.
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        // storage.get and .list calls not yet answered, read by the parent at this frame's 'load' (an answer may restyle the page); counted
+        // here, not there, because WebKit can run this frame's 'load' in the parent before a message posted while parsing has arrived.
+        let storageReadsOut = 0;
+        try { Object.defineProperty(window, '__storageReadsOut', { configurable: true, get: () => storageReadsOut }); } catch (e) {}
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+              storageReadsOut += 1;
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = newRequestId();
+              callbacksMap.set(id, { resolve, reject });
+              realParent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+              storageReadsOut += 1;
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = newRequestId();
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Null-body statuses: Response(stream, {status: 204}) throws
+                // per the Fetch spec, which would escape this resolver and
+                // hang the artifact's await forever.
+                if (response.status === 204 || response.status === 205 || response.status === 304) {
+                  try {
+                    resolve(new Response(null, {
+                      status: response.status,
+                      statusText: response.statusText,
+                      headers: response.headers
+                    }));
+                  } catch (err) {
+                    // Invalid statusText/header bytes can throw here too.
+                    reject(new TypeError(
+                      'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                    ));
+                  }
+                  return;
+                }
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream. Response()
+                // requires status in [200, 599]; an opaque/no-cors fetch
+                // forwards status 0, which would throw here and escape the
+                // resolver, hanging the artifact's await. Surface it as a
+                // network-error-shaped rejection instead.
+                try {
+                  resolve(new Response(stream, {
+                    status: response.status,
+                    statusText: response.statusText,
+                    headers: response.headers
+                  }));
+                } catch (err) {
+                  streamControllers.delete(channelId);
+                  reject(new TypeError(
+                    'Bridge fetch: unconstructable response (status ' + response.status + ')'
+                  ));
+                }
+              },
+              reject,
+              channelId
+            });
+            
+            realParent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          // Only the embedding parent may drive the bridge — sibling and
+          // nested frames can also postMessage into this window.
+          if (event.source !== realParent) return;
+          if (event.data.type === 'takeScreenshot') {
+            // Echo the request's nonce so the requester can correlate the
+            // reply to ITS request — a reply without the expected nonce
+            // (e.g. from a stale pre-remount artifact) is ignored upstream.
+            const screenshotNonce = event.data.nonce;
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: new Error('Root element not found'),
+              }, '*');
+              return;
+            }
+            // Catch CDN load failures and toPng errors so the parent always
+            // gets a response instead of hanging forever.
+            try {
+              const htmlToImage = await loadHtmlToImage();
+              // Draws only the top, 630/1200 of the width tall, as the link preview is 1200x630. `height` also shortens html-to-image's copy of the root and
+              // what its % min- and max-height resolve against, which moves centred content; `style` undoes that. Keep in step with app/page.tsx.
+              const previewHeight = Math.ceil((rootElement.offsetWidth * 630) / 1200);
+              const screenshot = await htmlToImage.toPng(rootElement, {
+                ...(rootElement.offsetHeight > previewHeight && {
+                  height: previewHeight,
+                  style: { height: window.getComputedStyle(rootElement).height, minHeight: '0', maxHeight: 'none' },
+                }),
+                imagePlaceholder:
+                  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+              });
+              realParent.postMessage({
+                type: 'screenshotData',
+                nonce: screenshotNonce,
+                data: screenshot,
+              }, '*');
+            } catch (err) {
+              realParent.postMessage({
+                type: 'screenshotError',
+                nonce: screenshotNonce,
+                error: err instanceof Error ? err : new Error(String(err)),
+              }, '*');
+            }
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (!callback) return;
+            storageReadsOut -= 1;
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        // An SVG <a> exposes href as an SVGAnimatedString; its baseVal is the attribute
+        // as written, so resolve it against the base URL as the browser does for an HTML <a>.
+        const resolvedHref = (linkEl) => {
+          if (typeof linkEl.href === "string") return linkEl.href;
+          const written = linkEl.href?.baseVal;
+          // A same-document SVG link, such as one that begins an animation, stays with the browser.
+          if (!written || written.trim().startsWith("#")) return "";
+          try {
+            return new RealURL(written, linkEl.baseURI).href;
+          } catch (error) {
+            return written;
+          }
+        };
+
+        // This frame's URL is about:srcdoc, so the browser resolves "#id" against the renderer
+        // page and would load that page in the frame instead of scrolling.
+        const sameDocumentFragment = (linkEl) => {
+          const written = linkEl.getAttribute("href")?.trim();
+          if (!written?.startsWith("#") || document.querySelector("base[href]")) return null;
+          return written.slice(1);
+        };
+
+        // Same as focusFragmentTarget in app/page.tsx; change both together.
+        const focusFragmentTarget = (target, focusVisible) => {
+          if (!document.hasFocus() || target === document.body) return;
+          target.focus({ preventScroll: true, focusVisible });
+          if (document.activeElement === target || target.hasAttribute("tabindex")) return;
+          const takeBack = () => {
+            if (document.activeElement === target) return;
+            target.removeAttribute("tabindex");
+            target.removeEventListener("blur", takeBack);
+          };
+          target.setAttribute("tabindex", "-1");
+          target.addEventListener("blur", takeBack);
+          target.focus({ preventScroll: true, focusVisible });
+          takeBack();
+        };
+
+        // Not location.replace: a navigation also scrolls and moves focus. replaceState fires no hashchange, so the page is told here.
+        const moveAddress = (fragment) => {
+          const oldURL = window.location.href;
+          const newURL = new RealURL("#" + fragment, oldURL).href;
+          if (newURL === oldURL) return;
+          try {
+            realHistory.replaceState(realHistory.state, "", newURL);
+          } catch (error) {
+            // Safari and Firefox throw when it is called too often.
+            return;
+          }
+          setTimeout(() => realDispatchEvent(new RealHashChangeEvent("hashchange", { oldURL, newURL })));
+        };
+
+        const scrollToFragment = (fragment, linkEl) => {
+          let decoded = fragment;
+          try {
+            decoded = realDecodeURIComponent(fragment);
+          } catch (error) {}
+          let target = document.getElementById(fragment) ?? document.getElementById(decoded);
+          for (const named of target ? [] : document.getElementsByName(decoded)) {
+            if (named.localName === "a") {
+              target = named;
+              break;
+            }
+          }
+          if (target) {
+            target.scrollIntoView();
+            focusFragmentTarget(target, linkEl.matches(":focus-visible"));
+          } else if (decoded.toLowerCase() === "top") {
+            window.scrollTo(0, 0);
+          } else {
+            return false;
+          }
+          return true;
+        };
+
+        // Same decoder as dataUrlFile in app/page.tsx; change both together.
+        const hexPair = /^[0-9a-f]{2}$/i;
+        const dataUrlFile = (href) => {
+          const hash = href.indexOf("#");
+          const url = hash === -1 ? href : href.slice(0, hash);
+          const comma = url.indexOf(",");
+          if (comma === -1) return null;
+          const header = url.slice(0, comma);
+          const payload = url.slice(comma + 1);
+          const mimeMatch = header.match(/data:([^;]+)/);
+          const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+          const declaredBase64 = header
+            .split(";")
+            .slice(1)
+            .some((param) => param.trim().toLowerCase() === "base64");
+          const type = mimeMatch ? mimeMatch[1].trim().toLowerCase() : "";
+          const binaryType = type !== "" && !type.startsWith("text/");
+          if (declaredBase64 || (binaryType && !payload.includes("%"))) {
+            let binary = null;
+            try {
+              binary = realAtob(
+                payload.replace(/%([0-9a-f]{2})/gi, (_, hex) => String.fromCharCode(parseInt(hex, 16))),
+              );
+            } catch (error) {
+              if (declaredBase64) return null;
+            }
+            if (binary !== null) {
+              const bytes = new Uint8Array(binary.length);
+              for (let i = 0; i < binary.length; i++) {
+                bytes[i] = binary.charCodeAt(i);
+              }
+              return { mimeType, data: bytes.buffer };
+            }
+          }
+          const input = new RealTextEncoder().encode(payload);
+          const bytes = new Uint8Array(input.length);
+          let length = 0;
+          for (let i = 0; i < input.length; i++) {
+            if (input[i] === 0x25 && i + 2 < input.length) {
+              const pair = String.fromCharCode(input[i + 1], input[i + 2]);
+              if (hexPair.test(pair)) {
+                bytes[length++] = parseInt(pair, 16);
+                i += 2;
+                continue;
+              }
+            }
+            bytes[length++] = input[i];
+          }
+          return { mimeType, data: bytes.slice(0, length).buffer };
+        };
+
+        const onLinkClick = (event) => {
+          // Not instanceof Element: an artifact's own top-level class Element shadows the global.
+          if (typeof event.target?.closest !== "function") return;
+    
+          const linkEl = event.target.closest("a, area[href]");
+          const href = linkEl && resolvedHref(linkEl);
+          if (!href) return;
+
+          const fragment = sameDocumentFragment(linkEl);
+          if (fragment !== null) {
+            const handledByArtifact = event.defaultPrevented;
+            event.preventDefault();
+            if (handledByArtifact || fragment === "") return;
+            // Not for a script's click while the person is in the chat: the page may take the keyboard when its address changes.
+            if (false && (event.isTrusted || document.hasFocus())) moveAddress(fragment);
+            if (scrollToFragment(fragment, linkEl)) return;
+            // A fragment that names nothing in the artifact may name something in the host,
+            // such as a project thread. The artifact's own listeners still see the click.
+            realParent.postMessage({ type: 'openExternal', href }, '*');
+            return;
+          }
+          const filename = linkEl.getAttribute("download") ?? "";
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+          followLink(href, filename);
+        };
+
+        const followLink = (href, filename) => {
+          if (href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              realParent.postMessage({
+                type: "downloadFile",
+                filename,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              }, downloadTarget);
+            });
+          } else if (href.startsWith("data:")) {
+            const file = dataUrlFile(href);
+            if (!file) return;
+            realParent.postMessage({
+              type: "downloadFile",
+              filename,
+              data: file.data,
+              mimeType: file.mimeType,
+            }, downloadTarget);
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            realParent.postMessage({
+              type: 'openExternal',
+              href,
+            }, '*');
+          }
+        };
+        window.addEventListener('click', onLinkClick);
+
+        // HACK: a click on an <a download> that is not in the document, or a dispatched click that does not bubble, never reaches the window
+        // listener, so the link gets a listener of its own while its click() or dispatchEvent() runs, after the artifact's. Change with app/page.tsx.
+        const RealAnchor = window.HTMLAnchorElement;
+        const RealMouseEvent = window.MouseEvent;
+        const anchorProto = RealAnchor?.prototype;
+        const superProto = anchorProto && Object.getPrototypeOf(anchorProto);
+        if (typeof RealAnchor === 'function' && typeof RealMouseEvent === 'function' && typeof superProto?.click === 'function' && typeof superProto?.dispatchEvent === 'function') {
+          const onMissedClick = (event) => {
+            if (!event.defaultPrevented) onLinkClick(event);
+          };
+          // Links whose click() or dispatchEvent() is running, so a call made during it leaves the outer call's listener in place.
+          const listening = new WeakSet();
+          const callHearingMissed = (anchor, bubbles, call) => {
+            if (!(anchor instanceof RealAnchor) || !anchor.hasAttribute('download') || (anchor.isConnected && bubbles) || listening.has(anchor)) {
+              return call();
+            }
+            listening.add(anchor);
+            anchor.addEventListener('click', onMissedClick);
+            try {
+              return call();
+            } finally {
+              listening.delete(anchor);
+              anchor.removeEventListener('click', onMissedClick);
+            }
+          };
+          anchorProto.click = function () {
+            return callHearingMissed(this, true, () => superProto.click.call(this));
+          };
+          anchorProto.dispatchEvent = function (event) {
+            const call = () => superProto.dispatchEvent.call(this, event);
+            return event instanceof RealMouseEvent && event.type === 'click' ? callHearingMissed(this, event.bubbles, call) : call();
+          };
+        }
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          realParent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+        // Only for a page that still shows nothing a second later: one that draws usually works on after a refused sound or a failed side call.
+        // A frame hidden behind the code view has no height, so a full-window canvas there would read as empty.
+        window.addEventListener('unhandledrejection', (event) => setTimeout(() => {
+          if (event.defaultPrevented || document.readyState === 'loading' || !window.innerHeight) return;
+          for (const el of document.querySelectorAll('body *')) {
+            if (el.getBoundingClientRect().height > 0) return;
+          }
+          if (document.body?.innerText.trim()) return;
+          realParent.postMessage({ type: 'console', message: 'Uncaught Error: ' + (event.reason?.message || event.reason) }, '*');
+        }, 1000));
+
+        try {
+          (() => {
+            const l=URL;function guardAgainstLeaving(t,d,g){const{navigation:n}=t;if(t===t.top||!(n instanceof t.EventTarget&&"currentEntry"in n))return()=>{};const{document:i,navigator:s}=t,o="userAgentData"in s,v=o?/^(about|blob):/:/^(?!https?:|data:)/,c=a=>{const{canIntercept:f,destination:u,downloadRequest:h}=a;if(a.defaultPrevented||!a.cancelable||f||h!==null||v.test(u.url)||(a.preventDefault(),!i.hasFocus()||!o&&i.activeElement?.matches(":read-write")))return;const e=new l(u.url),r=new l(i.baseURI);e.origin!==r.origin?s.userActivation?.isActive!==!1&&d(e.href):o&&e.hash&&e.pathname+e.search===r.pathname+r.search&&g?.(e.hash.slice(1))};return n.addEventListener("navigate",c),()=>n.removeEventListener("navigate",c)}
+            guardAgainstLeaving(window, (href) => followLink(href, ""), (fragment) => {
+              if (false) moveAddress(fragment);
+              scrollToFragment(fragment, document.activeElement ?? document.documentElement);
+            });
+          })();
+        } catch (e) {}
+
+        try {
+          (() => {
+            const m=1e3,b=Reflect.apply;function lacksWebgl(e,l=Object.getOwnPropertyDescriptor(e.HTMLCanvasElement.prototype,"getContext")?.value){if(typeof e.WebGLRenderingContext!="function")return!0;if(typeof l!="function")return!1;const u=e.document.createElement("canvas"),o=b(l,u,["webgl"])??b(l,u,["experimental-webgl"]);return o instanceof e.WebGLRenderingContext&&o.getExtension("WEBGL_lose_context")?.loseContext(),o===null}function watchWebgl(e,l){const u=e.setTimeout.bind(e),o=e.HTMLCanvasElement.prototype,i=Object.getOwnPropertyDescriptor(o,"getContext"),f=i?.value;if(!i||typeof f!="function")return()=>{};let s=!1,d=!1,p=!1,c=null;const g=new WeakSet,h=new WeakSet,C=t=>{const{width:n,height:r}=t.getBoundingClientRect();return t.isConnected&&t.ownerDocument===e.document&&n>0&&r>0},a=()=>{d||(d=p)},L=(t,n,r)=>{if(n!=="webgl"&&n!=="webgl2"&&n!=="experimental-webgl"){r&&h.add(t);return}if(r){c=!0;return}s||g.has(t)||(c??(c=!lacksWebgl(e,f)),!c&&(g.add(t),e.addEventListener("error",a),e.addEventListener("unhandledrejection",a),p=!0,u(()=>{p=!1},0),u(()=>{!s&&!h.has(t)&&(d||C(t))&&(s=!0,l())},1e3)))};return Object.defineProperty(o,"getContext",{...i,value:function(...n){const r=b(f,this,n);try{L(this,n[0],r!==null)}catch{}return r}}),()=>{s=!0,e.removeEventListener("error",a),e.removeEventListener("unhandledrejection",a),Object.defineProperty(o,"getContext",i)}}
+            watchWebgl(window, () => realParent.postMessage({ type: 'webglUnavailable' }, '*'));
+          })();
+        } catch (e) {}
+
+        // Last, so that if this throws, everything above is already set up. In its own function, so that its names stay local.
+        (() => {
+          function forwardConsole(o,t){const e=String,i=n=>{try{return e(n??"")}catch{return"[object Object]"}},c=[["log",""],["error","Error: "],["warn","Warning: "]];for(const[n,s]of c){const f=o[n];o[n]=(...r)=>{f.apply(o,r),t(s+r.map(i).join(" "))}}}
+          forwardConsole(window.console, (line) => realParent.postMessage({ type: 'console', message: line }, '*'));
+        })();
+      })();
+    </script>
+  <style id="claude-scrollbar">@layer claude-scrollbar{*{scrollbar-width:thin}html{scrollbar-color:rgb(128 128 128 / 50%) transparent}}</style><script>
+(function(){"use strict";if(window.__coworkHtmlReviewGuest)return;window.__coworkHtmlReviewGuest=true;var READY_TYPE="__cowork_html_review_ready__";var SEL_CLASS="__cwhr-sel";var CONTEXT_LEN=32;var EXACT_CAP=1000;var port=null;var mode=false;var chordLive=false;var pins=[];var quotes=[];var quoteRanges=Object.create(null);var hoverEl=null;var selected=null;var hasTextSel=false;var rafPending=false;var _MessageChannel=window.MessageChannel;var _topPost=window.top.postMessage.bind(window.top);function visibleText(el){var t=typeof el.innerText==="string"?el.innerText:(el.textContent||"");return t.replace(/\s+/g," ").trim();}var BUBBLE_CURSOR= "url(\"data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E\") 1 23, url(\"data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC\") 1 23, default";function injectStyle(){var style=document.createElement("style");var ANY=":not(#__cwhr_)";var MODE="html[data-cwhr-mode]";var COMPOSING=MODE+"[data-cwhr-composing]";style.textContent="."+SEL_CLASS+"{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}"+MODE+ANY+","+MODE+" "+ANY+"{cursor:"+BUBBLE_CURSOR+" !important;}"+COMPOSING+ANY+","+COMPOSING+" "+ANY+"{cursor:default !important;}";(document.head||document.documentElement).appendChild(style);}function isUnique(sel){try{return document.querySelectorAll(sel).length===1;}catch(e){return false;}}function hasInvisibles(s){for(var i=0;i<s.length;i++){var c=s.codePointAt(i);if(c>0xffff)i++;if(c<=0x1f||c===0x061c||c===0x070f||c===0xad||(c>=0x7f&&c<=0x9f)||c===0x115f||c===0x1160||c===0x180e||(c>=0x200b&&c<=0x200f)||(c>=0x202a&&c<=0x202e)||(c>=0x2060&&c<=0x2064)||(c>=0x2066&&c<=0x2069)||c===0x3164||c===0xfeff||(c>=0xfff9&&c<=0xfffb)||c===0xffa0||(c>=0xe0000&&c<=0xe007f)){return true;}}return false;}function escapeAttr(v){return String(v).replace(/\\/g,"\\\\").replace(/"/g,'\\"');}function selectorFor(el){if(el.id&&!hasInvisibles(el.id)&&isUnique("#"+CSS.escape(el.id))){return"#"+CSS.escape(el.id);}for(var i=0;i<el.attributes.length;i++){var attr=el.attributes[i];if(attr.name.indexOf("data-")===0&&attr.value&&!hasInvisibles(attr.value)){var dataSel="["+attr.name+'="'+escapeAttr(attr.value)+'"]';if(isUnique(dataSel))return dataSel;}}var parts=[];var cur=el;while(cur&&cur!==document.body&&cur.nodeType===1&&parts.length<10){var sel=cur.tagName.toLowerCase();var parent=cur.parentElement;if(parent){var sameTag=[];for(var c=0;c<parent.children.length;c++){if(parent.children[c].tagName===cur.tagName)sameTag.push(parent.children[c]);}if(sameTag.length>1){sel+=":nth-of-type("+(sameTag.indexOf(cur)+1)+")";}}parts.unshift(sel);if(parent&&parent.id&&!hasInvisibles(parent.id)&&isUnique("#"+CSS.escape(parent.id))){parts.unshift("#"+CSS.escape(parent.id));return parts.join(" > ");}cur=parent;}if(cur===document.body){parts.unshift("body");return parts.join(" > ");}return":not(*)";}function descriptorFor(el){var tag="<"+el.tagName.toLowerCase()+">";var idPart=el.id?" #"+el.id:"";var text=visibleText(el).slice(0,60);var textPart=text?' "'+text+'"':"";var section=el.parentElement;while(section&&(!section.id||section.id.indexOf("artifacts-component-root")===0)){section=section.parentElement;}var sectionPart=section&&section.id?" in #"+section.id:"";return(tag+idPart+textPart+sectionPart).slice(0,400);}function textOffset(node,offset){var body=document.body;if(!body)return-1;try{var pre=document.createRange();pre.selectNodeContents(body);pre.setEnd(node,offset);return pre.toString().length;}catch(e){return-1;}}function rangeForOffsets(start,end){var body=document.body;if(!body)return null;var walker=document.createTreeWalker(body,NodeFilter.SHOW_TEXT);var acc=0;var range=document.createRange();var haveStart=false;var t;while((t=walker.nextNode())){var next=acc+t.length;if(!haveStart&&start<next){range.setStart(t,start-acc);haveStart=true;}if(haveStart&&end<=next){range.setEnd(t,end-acc);return range;}acc=next;}return null;}function locateQuote(text,q){var ex=q.exact;if(!ex)return null;var hint=q.startOffset>=0?q.startOffset:0;if(text.slice(hint,hint+ex.length)===ex){return{start:hint,end:hint+ex.length};}var best=-1;var bestScore=-1;var bestDist=Infinity;var scanned=0;for(var idx=text.indexOf(ex);idx!==-1&&++scanned<=1000;idx=text.indexOf(ex,idx+1)){var before=text.slice(Math.max(0,idx-CONTEXT_LEN),idx);var after=text.slice(idx+ex.length,idx+ex.length+CONTEXT_LEN);var sc=0;for(var i=1;i<=q.prefix.length&&i<=before.length;i++){if(q.prefix[q.prefix.length-i]!==before[before.length-i])break;sc++;}for(var j=0;j<q.suffix.length&&j<after.length;j++){if(q.suffix[j]!==after[j])break;sc++;}var dist=Math.abs(idx-hint);if(sc>bestScore||(sc===bestScore&&dist<bestDist)){best=idx;bestScore=sc;bestDist=dist;}}return best===-1?null:{start:best,end:best+ex.length};}function collectLineRects(range,cap){var out=[];var rects=range.getClientRects();for(var i=0;i<rects.length&&out.length<cap;i++){var r=rects[i];if(r.width>0&&r.height>0){out.push({x:r.left,y:r.top,w:r.width,h:r.height});}}return out;}function reportTextSel(full){if(!port)return;var sel=window.getSelection();var r=sel&&!sel.isCollapsed&&sel.rangeCount>0?sel.getRangeAt(0):null;if(!r||!document.body||!document.body.contains(r.commonAncestorContainer)){if(hasTextSel){hasTextSel=false;port.postMessage({type:"textClear"});}return;}hasTextSel=true;var br=r.getBoundingClientRect();var msg={type:"textCapture",rect:{x:br.left,y:br.top,w:br.width,h:br.height},lineRects:collectLineRects(r,80),};if(full){var live=document.body.textContent||"";var so=textOffset(r.startContainer,r.startOffset);var eo=textOffset(r.endContainer,r.endOffset);if(so<0||eo<0||eo<=so){hasTextSel=false;port.postMessage({type:"textClear"});return;}var capped=Math.min(eo,so+EXACT_CAP);if(capped<eo){var hc=live.charCodeAt(capped-1);if(hc>=0xd800&&hc<=0xdbff)capped--;}if(capped<=so){port.postMessage(msg);return;}var pStart=Math.max(0,so-CONTEXT_LEN);var pc=live.charCodeAt(pStart);if(pc>=0xdc00&&pc<=0xdfff)pStart++;var sEnd=Math.min(live.length,capped+CONTEXT_LEN);if(sEnd<live.length){var sc=live.charCodeAt(sEnd-1);if(sc>=0xd800&&sc<=0xdbff)sEnd--;}msg.exact=live.slice(so,capped);msg.prefix=live.slice(pStart,so);msg.suffix=live.slice(capped,sEnd);msg.startOffset=so;msg.endOffset=capped;}port.postMessage(msg);}function clearSelection(){if(selected){selected.classList.remove(SEL_CLASS);selected=null;}}var cursorPending=false;var cursorX=-1;var cursorY=-1;function flushCursor(){cursorPending=false;if(!port)return;var hover=null;if(hoverEl&&hoverEl.nodeType===1&&hoverEl!==document.body&&hoverEl!==document.documentElement){var r=hoverEl.getBoundingClientRect();if(r.width>0||r.height>0){hover={x:r.left,y:r.top,w:r.width,h:r.height};}}port.postMessage({type:"cursor",x:cursorX,y:cursorY,hover:hover});}function scheduleCursor(){if(!cursorPending){cursorPending=true;requestAnimationFrame(flushCursor);}}function onMouseMove(ev){if(!mode||!port)return;var de=document.documentElement;if(ev.clientX>=de.clientWidth||ev.clientY>=de.clientHeight){cursorX=-1;cursorY=-1;hoverEl=null;scheduleCursor();return;}cursorX=ev.clientX;cursorY=ev.clientY;hoverEl=ev.target;scheduleCursor();}function onMouseLeave(){if(!mode||!port)return;cursorX=-1;cursorY=-1;hoverEl=null;scheduleCursor();}function onClick(ev){if(!port)return;if(!mode){var s=window.getSelection();if(!s||s.isCollapsed)port.postMessage({type:"clickAway"});return;}ev.preventDefault();ev.stopImmediatePropagation();var el=ev.target;if(!el||el.nodeType!==1||el===document.documentElement)return;if(el===document.body&&el.firstElementChild){}clearSelection();selected=el;el.classList.add(SEL_CLASS);var rect=el.getBoundingClientRect();var pinX=rect.width>0?(ev.clientX-rect.left)/ rect.width:0.5;var pinY=rect.height>0?(ev.clientY-rect.top)/ rect.height:0.5;port.postMessage({type:"capture",selector:selectorFor(el).slice(0,1000),textHint:visibleText(el).slice(0,300),descriptor:descriptorFor(el),pinX:Math.min(1,Math.max(0,pinX)),pinY:Math.min(1,Math.max(0,pinY)),clientX:ev.clientX,clientY:ev.clientY,rectLeft:rect.left,rectTop:rect.top,});}var keyEl=null;var keyAt=-1;function collectBlocks(el,out){for(var c=el.firstElementChild;c&&out.length<2000;c=c.nextElementSibling){var drawn=c.getClientRects().length>0;var own=/^(tr|img|svg|canvas|video|iframe|input|select|textarea|button|pre)$/i.test(c.tagName);for(var n=c.firstChild;n&&!own;n=n.nextSibling)own=n.nodeType===3&&/\S/.test(n.data);if(drawn&&own)out.push(c);var inner=!own||c.querySelector("p,h1,h2,h3,h4,h5,h6,li")?c:null;if(inner&&(drawn||getComputedStyle(c).display==="contents"))collectBlocks(inner,out);}return out;}function step(by){if(!mode||by===null)return onMouseLeave();var blocks=collectBlocks(document.body,[]);var i=blocks.indexOf(keyEl);if(i<0&&keyEl)i=keyAt;if(i<0)i=blocks.findIndex(function(b){return b.getBoundingClientRect().top>=0;});else i+=by;i=Math.max(0,Math.min(blocks.length-1,i));keyEl=hoverEl=blocks[i]||null;keyAt=i;if(!keyEl)return;keyEl.scrollIntoView({block:"nearest",inline:"nearest",behavior:"instant"});cursorX=cursorY=0;scheduleCursor();var tag=keyEl.tagName.toLowerCase();var label=keyEl.getAttribute("aria-label");var drawn=tag==="svg"||tag==="canvas"||keyEl.getAttribute("role")==="img";var text=(drawn&&label)||visibleText(keyEl)||keyEl.getAttribute("alt")||label||"";port.postMessage({type:"block",text:text.slice(0,300),tag:tag,index:i,count:blocks.length});}function pick(){if(!mode||!keyEl||!keyEl.isConnected)return;var r=keyEl.getBoundingClientRect();var nothing=function(){};onClick({target:keyEl,clientX:Math.max(0,r.left)+Math.min(12,r.width/ 2),clientY:Math.max(0,r.top)+Math.min(12,r.height/ 2),preventDefault:nothing,stopImmediatePropagation:nothing,});}function reportRects(){rafPending=false;if(!port)return;if(selected){var sr=selected.getBoundingClientRect();port.postMessage({type:"selRect",left:sr.left,top:sr.top,w:sr.width,h:sr.height,found:(sr.width>0||sr.height>0)&&document.documentElement.contains(selected),});}var rects=[];for(var i=0;i<pins.length;i++){var p=pins[i];var el=null;try{el=document.querySelector(p.selector);}catch(e){el=null;}if(!el){rects.push({id:p.id,x:0,y:0,found:false});continue;}var r=el.getBoundingClientRect();if(r.width===0&&r.height===0){rects.push({id:p.id,x:0,y:0,found:false});continue;}rects.push({id:p.id,x:r.left+p.pinX*r.width,y:r.top+p.pinY*r.height,found:true,});}var quoteRects=[];if(quotes.length>0){var live=null;for(var qi=0;qi<quotes.length;qi++){var q=quotes[qi];var qr=quoteRanges[q.id];if(qr===undefined){if(live===null){live=(document.body&&document.body.textContent)||"";}var loc=locateQuote(live,q);qr=(loc&&rangeForOffsets(loc.start,loc.end))||null;quoteRanges[q.id]=qr;}var qlr=qr?collectLineRects(qr,80):[];quoteRects.push(qlr.length>0?{id:q.id,found:true,lineRects:qlr}:{id:q.id,found:false,lineRects:[]});}}sentScrollY=window.scrollY||0;port.postMessage({type:"rects",rects:rects,quoteRects:quoteRects,scrollY:sentScrollY,});}function scheduleRects(){if(rafPending)return;rafPending=true;var done=false;function run(){if(done)return;done=true;reportRects();}requestAnimationFrame(run);setTimeout(run,150);}var sentScrollY=0;function scheduleAnchoredRects(){if(selected||pins.length>0||quotes.length>0)scheduleRects();}function setMode(on){mode=!!on;document.documentElement.toggleAttribute("data-cwhr-mode",mode);if(!mode){hoverEl=keyEl=null;clearSelection();}}function setComposing(open){document.documentElement.toggleAttribute("data-cwhr-composing",!!open);}function onPortMessage(ev){var data=ev.data;if(!data)return;if(data.type==="mode")setMode(data.on);else if(data.type==="composing")setComposing(data.open);else if(data.type==="chordLive")chordLive=!!data.on;else if(data.type==="step")step(data.by);else if(data.type==="pick")pick();else if(data.type==="pins"){pins=Array.isArray(data.pins)?data.pins:[];scheduleRects();}else if(data.type==="quotes"){quotes=Array.isArray(data.quotes)?data.quotes:[];quoteRanges=Object.create(null);scheduleRects();}else if(data.type==="clearSelection"){clearSelection();}else if(data.type==="clearTextSel"){var ts=window.getSelection();if(ts)ts.removeAllRanges();hasTextSel=false;}else if(data.type==="restoreScroll"){var ry=Number(data.y);if(isFinite(ry)&&ry>0){window.scrollTo(0,ry);window.addEventListener("load",function(){window.scrollTo(0,ry);});}}}function start(){injectStyle();var channel=new _MessageChannel();port=channel.port1;port.onmessage=onPortMessage;_topPost({type:READY_TYPE,token:"90d8c8f5-b6dc-48df-a261-c2814c67bfda"},"*",[channel.port2]);document.addEventListener("mousemove",onMouseMove,true);document.documentElement.addEventListener("mouseleave",onMouseLeave);document.addEventListener("click",onClick,true);function onSelCommit(){reportTextSel(true);}document.addEventListener("mouseup",onSelCommit,true);document.addEventListener("keyup",onSelCommit,true);document.addEventListener("selectionchange",function(){var s=window.getSelection();if(hasTextSel&&(!s||s.isCollapsed))reportTextSel(false);});document.addEventListener("keydown",function(ev){if(ev.key==="Escape"&&port)port.postMessage({type:"dismiss"});if(chordLive&&port&&ev.altKey){var t=ev.composedPath?ev.composedPath()[0]:ev.target;var editable=!!t&&(t.isContentEditable===true||t.tagName==="INPUT"||t.tagName==="TEXTAREA"||t.tagName==="SELECT");if(!editable&&ev.code==="KeyC"&&!ev.metaKey&&!ev.ctrlKey&&!ev.shiftKey)ev.preventDefault();if(!ev.repeat){port.postMessage({type:"chord",key:ev.key,code:ev.code,meta:ev.metaKey,ctrl:ev.ctrlKey,shift:ev.shiftKey,composing:ev.isComposing===true,editable:editable,});}}},true);var textSelPending=false;function scheduleTextSel(){if(textSelPending)return;textSelPending=true;requestAnimationFrame(function(){textSelPending=false;reportTextSel(false);});}function onLayoutChange(){scheduleRects();if(mode&&hoverEl)scheduleCursor();if(hasTextSel)scheduleTextSel();}window.addEventListener("scroll",onLayoutChange,true);window.addEventListener("resize",onLayoutChange);var observer=new MutationObserver(function(){quoteRanges=Object.create(null);scheduleAnchoredRects();if(hasTextSel)scheduleTextSel();});function observe(){if(document.body)observer.observe(document.body,{childList:true,subtree:true});}if(document.body)observe();else document.addEventListener("DOMContentLoaded",observe);setInterval(function(){if((window.scrollY||0)!==sentScrollY)scheduleRects();else scheduleAnchoredRects();},2000);}if(document.readyState==="loading"){document.addEventListener("DOMContentLoaded",start);}else{start();}})();
+</script>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Undangan Pernikahan Aku &amp; Kamu</title>
+<link href="https://fonts.googleapis.com/css2?family=Cormorant+Garamond:ital,wght@0,400;0,500;0,600;1,400&amp;family=Great+Vibes&amp;display=swap" rel="stylesheet">
+<style>
+:root{--pri:#c9a45c;--bg:#fbf7f4;--txt:#3a2c33;--gold:linear-gradient(135deg,color-mix(in srgb,var(--pri),#fff 45%),var(--pri) 45%,color-mix(in srgb,var(--pri),#000 28%));--soft:color-mix(in srgb,var(--pri) 10%,var(--bg));--serif:'Cormorant Garamond','Playfair Display',Georgia,serif;--script:'Great Vibes','Pinyon Script','Snell Roundhand','Segoe Script','Brush Script MT',cursive}
+*{box-sizing:border-box;margin:0}
+html{scroll-behavior:smooth}
+body{font-family:var(--serif);background:var(--bg);color:var(--txt);font-size:20px;line-height:1.65;overflow-x:hidden}
+body.lock{overflow:hidden;height:100vh}
+button,input,textarea,select{font:inherit}
+.sc{font-family:var(--script);font-weight:400}
+.gt{background:var(--gold);-webkit-background-clip:text;background-clip:text;color:transparent}
+.it{font-style:italic;letter-spacing:.05em}
+/* sampul */
+#cover{position:fixed;inset:0;z-index:50;display:flex;flex-direction:column;align-items:center;justify-content:center;text-align:center;color:#fff;padding:24px;overflow:hidden;background:radial-gradient(ellipse at 50% 25%,color-mix(in srgb,var(--txt),#fff 16%),var(--txt) 72%) center/cover;transition:transform 1.4s cubic-bezier(.7,0,.2,1)}
+#cover::before{content:"";position:absolute;inset:0;background:linear-gradient(rgba(10,6,9,.35),rgba(10,6,9,.62))}
+#cover>*{position:relative}
+#cover.open{transform:translateY(-101%)}
+#cover>.fl{position:absolute;width:min(36vw,160px);height:auto;color:var(--pri);opacity:.8}
+#cover>.pt{position:absolute;top:-24px;border-radius:150% 0 150% 0;background:color-mix(in srgb,var(--pri) 35%,#f4c7cf);opacity:.7;pointer-events:none;animation:fall linear infinite}
+@keyframes fall{to{transform:translate(70px,112vh) rotate(540deg)}}
+.arch{width:min(76vw,320px);padding:52px 18px 36px;border:1px solid var(--pri);border-radius:999px 999px 16px 16px;box-shadow:0 0 0 7px transparent,0 0 0 8px color-mix(in srgb,var(--pri) 50%,transparent);background:rgba(255,255,255,.07);backdrop-filter:blur(4px)}
+.mono{font-size:clamp(70px,22vw,104px);line-height:1.05;margin:6px 0 2px}
+.mono span+span,.mono .amp2{margin-left:.06em}
+.cn{font-size:1.3em;font-weight:500;line-height:1.3;margin-bottom:6px}
+#cover .guest{margin-top:28px;font-size:.95em}
+#cover .guest b{display:block;font-size:1.45em;font-weight:600;font-style:normal;letter-spacing:0}
+.btn{display:inline-block;border:1px solid var(--pri);background:var(--gold);color:#2b2026;padding:12px 32px;border-radius:40px;text-decoration:none;cursor:pointer;font-weight:600;letter-spacing:.03em;box-shadow:0 8px 20px -10px rgba(0,0,0,.5);transition:transform .2s,filter .2s}
+.btn:hover{filter:brightness(1.07);transform:translateY(-2px)}
+#cover .btn{margin-top:20px}
+/* isi */
+section{padding:88px 24px;text-align:center}
+section>*{max-width:680px;margin-left:auto;margin-right:auto}
+section>.cards{max-width:740px}
+main>section:nth-of-type(even){background:var(--soft)}
+h2{font-family:var(--script);font-weight:400;font-size:3.1em;line-height:1.15;margin-bottom:10px;background:var(--gold);-webkit-background-clip:text;background-clip:text;color:transparent}
+.dv{display:block;width:150px;height:12px;color:var(--pri);margin:0 auto 26px}
+.hero{min-height:100vh;display:flex;flex-direction:column;justify-content:center;align-items:center;color:#fff;position:relative;background:radial-gradient(ellipse at 50% 30%,color-mix(in srgb,var(--txt),#fff 16%),var(--txt) 75%) center/cover!important}
+.hero::before{content:"";position:absolute;inset:0;background:linear-gradient(rgba(10,6,9,.4),rgba(10,6,9,.65))}
+.hero>*{position:relative}
+.hero .names{font-size:clamp(54px,15vw,100px);line-height:1.05;margin:12px 0 14px}
+.cd{display:flex;gap:12px;justify-content:center;margin-top:30px}
+.cd div{width:70px;height:70px;border-radius:50%;border:1px solid var(--pri);display:grid;place-content:center;background:rgba(255,255,255,.08);backdrop-filter:blur(3px);line-height:1.1}
+.cd b{font-size:1.45em;font-weight:600}
+.cd span{font-size:.68em;opacity:.85}
+.quote{font-style:italic;max-width:540px;font-size:1.08em}
+.photo{width:230px;aspect-ratio:3/4;border-radius:999px 999px 14px 14px;margin:0 auto 34px;background:var(--pri) center/cover;box-shadow:0 0 0 7px var(--bg),0 0 0 8px var(--pri),0 24px 40px -22px rgba(0,0,0,.5)}
+.photo:not(.has){display:none}
+.who{font-family:var(--script);font-size:3em;line-height:1.2;background:var(--gold);-webkit-background-clip:text;background-clip:text;color:transparent}
+.par{font-style:italic;opacity:.85;margin-bottom:6px}
+.amp{font-family:var(--script);font-size:3em;color:var(--pri);margin:2px 0 4px}
+.cards{display:grid;gap:22px;grid-template-columns:repeat(auto-fit,minmax(250px,1fr))}
+.card{position:relative;background:rgba(255,255,255,.7);border:1px solid color-mix(in srgb,var(--pri) 70%,transparent);border-radius:999px 999px 16px 16px;padding:64px 22px 38px;box-shadow:0 18px 34px -22px rgba(0,0,0,.35)}
+.card::after{content:"";position:absolute;inset:7px;border:1px solid color-mix(in srgb,var(--pri) 35%,transparent);border-radius:999px 999px 10px 10px;pointer-events:none}
+.card h3{font-family:var(--script);font-weight:400;font-size:2.3em;line-height:1.2;color:var(--pri)}
+.card .t{font-size:1.2em;font-weight:600;margin:6px 0}
+.date{font-size:1.45em;margin-bottom:26px}
+#rsvp{background:radial-gradient(ellipse at 50% 0,color-mix(in srgb,var(--txt),#fff 14%),var(--txt) 70%);color:#fff}
+#rsvp form{max-width:430px;margin:24px auto 0;display:grid;gap:14px;text-align:left}
+#rsvp input,#rsvp textarea,#rsvp select{width:100%;padding:12px 16px;border-radius:12px;border:1px solid color-mix(in srgb,var(--pri) 60%,transparent);background:rgba(255,255,255,.08);color:#fff}
+#rsvp select option{color:#222}
+#rsvp ::placeholder{color:rgba(255,255,255,.55)}
+#rsvp label{font-size:.85em;opacity:.85}
+#rsvp .btn{width:100%;margin-top:4px}
+footer{padding:70px 24px 100px;text-align:center;border-top:1px solid color-mix(in srgb,var(--pri) 40%,transparent)}
+footer .who{font-size:2.8em;margin-top:18px}
+/* musik & edit */
+.fab{position:fixed;right:16px;z-index:40;width:46px;height:46px;border-radius:50%;border:1px solid var(--pri);background:var(--bg);color:var(--pri);font-size:19px;cursor:pointer;display:none;place-items:center;box-shadow:0 4px 14px rgba(0,0,0,.18)}
+body.ready .fab#mus{display:grid;bottom:16px}
+body.ready.playing #mus{animation:spin 6s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+#edb{bottom:72px;z-index:60;display:none}
+body[data-mode=edit] #edb{display:grid}
+/* editor */
+#ed{position:fixed;top:0;right:0;bottom:0;width:min(380px,100%);background:#fff;color:#222;z-index:70;transform:translateX(105%);transition:transform .35s;overflow-y:auto;padding:18px;font-family:system-ui,sans-serif;font-size:14px;box-shadow:-8px 0 30px rgba(0,0,0,.25)}
+#ed.on{transform:none}
+#ed h4{font-size:17px;margin-bottom:4px}
+#ed p.hint{color:#666;margin-bottom:14px;font-size:12.5px}
+#ed label{display:block;margin:10px 0 3px;font-weight:600;font-size:12.5px}
+#ed input[type=text],#ed input[type=date],#ed textarea{width:100%;padding:8px 10px;border:1px solid #ccc;border-radius:6px;font-size:14px}
+#ed textarea{min-height:64px;resize:vertical}
+.row{display:flex;gap:10px}.row>div{flex:1}
+#ed input[type=color]{width:100%;height:36px;border:1px solid #ccc;border-radius:6px;padding:2px}
+#ed .sv{position:sticky;bottom:-18px;background:#fff;padding:12px 0 6px;margin-top:16px;display:flex;gap:8px;border-top:1px solid #eee}
+#ed .sv button{flex:1;padding:11px;border-radius:8px;border:0;background:#26362f;color:#fff;font-weight:600;cursor:pointer}
+#ed .sv button.o{background:#eee;color:#222}
+#ed .x{position:absolute;top:10px;right:14px;border:0;background:none;font-size:24px;cursor:pointer}
+#msg{font-size:12.5px;color:#2a7a4b;min-height:16px;margin-top:6px}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+</style>
+<style>.__cwhr-sel{outline:1px solid hsl(40 70% 40%) !important;outline-offset:0;}html[data-cwhr-mode]:not(#__cwhr_),html[data-cwhr-mode] :not(#__cwhr_){cursor:url("data:image/svg+xml,%3Csvg%20xmlns%3D'http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg'%20width%3D'24'%20height%3D'24'%20viewBox%3D'0%200%2024%2024'%3E%3Cpath%20d%3D'M12%20.5h0A11.5%2011.5%200%200%201%2023.5%2012v0A11.5%2011.5%200%200%201%2012%2023.5H2.5a2%202%200%200%201-2-2V12A11.5%2011.5%200%200%201%2012%20.5Z'%20fill%3D'%23fff'%20stroke%3D'rgba(0%2C0%2C0%2C0.22)'%20stroke-width%3D'1'%2F%3E%3C%2Fsvg%3E") 1 23, url("data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAYAAADgdz34AAACjklEQVR4AbRWS2gaURR9TGpiFTUEWpKQkA+EruqizWcRSBRT/G8KKpXiyo0ra1fVNiDFLmypFUo3iht/iO4Uay1FGwtFECl1p6KWLly4CGqrSMTY+wRFQ7WhGYd7Zu697845b+7M8B6BJh+UxcXFG3a7XeTxeHQAC+C12+1+ZLPZhHgMbp8FjLWxAkaj8U48Hg8lEomfIpEoLBaLLTKZTAd4LJFI3kD8HsZ+xGKxoMFgYI9T+JvAtUAg8FylUn3hcDj8ra0t6vLyMmKxWIhCofSAfZyDMRqXy+Wr1eqvPp/vKYjMAEZsRMDpdN6MRCKf+Xz+8cbGBm2kckIAtXShUGgKh8Mnfr9/Ybh0IKDT6a4vLS19EggE+wwGY7jmUj6TyUTQyv35+fmP0MbBexkISKVS+97e3u1LsU0oAo67Go3G1i/pCZjN5t3Nzc0H/zPzPlH/ip8EWvbQYrHs4hwWmN3e3n62traGfZy7MtbX12fYbPYTIKIQOzs7C6urq/cgINVWVlaO4EtjEXq9nken06mksgMZtJthtVp5xNzcHBsEIEWu0Wg0RKVS2USz2WTigFx6hPCkMTfRarXgB6WQzd/j63Q6bdK+nB7j0KnRaCCCIMpTE4D2oEql8m1qAvV6/VSr1U5PIJvN+qFjv6fyBIVC4ZfD4XgJAmekC9RqNZROp1+FQqESCCDSBWCVO1EoFC8wOQZpAnjm0Wj0O/xX94H4HNAzotvtNnreFU6lUgllMplAMpnclcvlp8NURC6Xi8BLGc5N9NvtNqpWq6hcLqN8Pn8OLUkAMe/g4EAOG4WzizcTJpPpA6zFIpfL9Ra2I45/IRgM2lKp1LtisXjs9XpvHR4eHimVythF4n78BwAA//8r8OPFAAAABklEQVQDAPCY8Oae0TJxAAAAAElFTkSuQmCC") 1 23, default !important;}html[data-cwhr-mode][data-cwhr-composing]:not(#__cwhr_),html[data-cwhr-mode][data-cwhr-composing] :not(#__cwhr_){cursor:default !important;}</style></head>
+<body class="lock" data-mode="view" id="artifacts-component-root-html">
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<g id="fl" fill="none" stroke="currentColor" stroke-width="1.2"><path d="M4 118C20 84 44 52 70 34C86 23 100 14 116 4"></path><g fill="currentColor" fill-opacity=".55" stroke-width=".6"><path d="M26 88c-12-4-18-14-16-24c11 3 18 12 16 24z"></path><path d="M40 66c10-6 12-18 6-26c-9 6-11 17-6 26z"></path><path d="M62 46c-10-2-18-10-18-20c10 2 18 9 18 20z"></path><path d="M78 30c10-3 18-12 18-22c-10 3-17 11-18 22z"></path><path d="M44 76c12 2 20 10 22 20c-12-1-20-8-22-20z"></path><path d="M64 52c12 0 20 6 24 16c-12 0-21-5-24-16z"></path></g></g>
+<g id="dv" fill="none" stroke="currentColor"><path d="M0 7H82M118 7H200"></path><path d="M100 1.5l5.5 5.5-5.5 5.5-5.5-5.5z" fill="currentColor"></path><circle cx="88" cy="7" r="1.6" fill="currentColor"></circle><circle cx="112" cy="7" r="1.6" fill="currentColor"></circle></g>
+</defs></svg>
+<div id="cover" class=""><i class="pt" style="left: 25.372%; width: 9.01605px; height: 10.387px; animation-duration: 14.1591s; animation-delay: -13.8642s;"></i><i class="pt" style="left: 82.7247%; width: 8.12324px; height: 12.2883px; animation-duration: 14.6959s; animation-delay: -0.400769s;"></i><i class="pt" style="left: 53.9554%; width: 8.41233px; height: 19.4486px; animation-duration: 10.4954s; animation-delay: -5.46103s;"></i><i class="pt" style="left: 7.69894%; width: 16.5869px; height: 10.78px; animation-duration: 15.4004s; animation-delay: -1.29778s;"></i><i class="pt" style="left: 89.1482%; width: 8.84035px; height: 15.3876px; animation-duration: 17.6889s; animation-delay: -2.04591s;"></i><i class="pt" style="left: 42.9351%; width: 8.84804px; height: 16.2576px; animation-duration: 16.6329s; animation-delay: -2.85644s;"></i><i class="pt" style="left: 65.0432%; width: 9.43735px; height: 13.1633px; animation-duration: 16.7731s; animation-delay: -5.71472s;"></i><i class="pt" style="left: 71.8281%; width: 8.76525px; height: 12.3237px; animation-duration: 9.77271s; animation-delay: -0.174628s;"></i><i class="pt" style="left: 53.6159%; width: 9.92236px; height: 15.1699px; animation-duration: 15.5151s; animation-delay: -12.2949s;"></i><i class="pt" style="left: 70.6945%; width: 11.29px; height: 10.5549px; animation-duration: 15.0899s; animation-delay: -10.25s;"></i><i class="pt" style="left: 47.4969%; width: 13.8011px; height: 17.3986px; animation-duration: 12.1127s; animation-delay: -3.41231s;"></i><i class="pt" style="left: 81.3572%; width: 16.8967px; height: 18.9931px; animation-duration: 17.5721s; animation-delay: -7.35375s;"></i><i class="pt" style="left: 81.4617%; width: 13.9095px; height: 19.5986px; animation-duration: 16.8805s; animation-delay: -5.80738s;"></i><i class="pt" style="left: 99.0693%; width: 9.98342px; height: 18.1568px; animation-duration: 13.7815s; animation-delay: -9.16861s;"></i>
+  <svg class="fl" style="top:0;left:0" viewBox="0 0 120 120" aria-hidden="true"><use href="#fl"></use></svg><svg class="fl" style="top:0;right:0;transform:scaleX(-1)" viewBox="0 0 120 120" aria-hidden="true"><use href="#fl"></use></svg><svg class="fl" style="bottom:0;left:0;transform:scaleY(-1)" viewBox="0 0 120 120" aria-hidden="true"><use href="#fl"></use></svg><svg class="fl" style="bottom:0;right:0;transform:rotate(180deg)" viewBox="0 0 120 120" aria-hidden="true"><use href="#fl"></use></svg>
+  <div class="arch">
+    <p class="it">The Wedding of</p>
+    <div class="mono sc gt"><span data-i="g">A</span><span>&amp;</span><span data-i="b">K</span></div>
+    <p class="cn"><span data-k="g">Aku</span> &amp; <span data-k="b">Kamu</span></p>
+    <p class="it" data-d="long">Selasa, 29 Juni 2032</p>
+  </div>
+  <p class="guest it">Kepada Yth.<b id="guest">Tamu Undangan</b></p>
+  <button class="btn" id="openBtn">Buka Undangan</button>
+</div>
+
+<main>
+  <section class="hero" id="hero">
+    <p class="it">Kami akan menikah</p>
+    <div class="names sc gt"><span data-k="g">Aku</span><br>&amp; <span data-k="b">Kamu</span></div>
+    <p style="font-size:1.3em" data-d="long">Selasa, 29 Juni 2032</p>
+    <div class="cd" id="cd"><div><b>2044</b><span>Hari</span></div><div><b>15</b><span>Jam</span></div><div><b>24</b><span>Menit</span></div><div><b>50</b><span>Detik</span></div></div>
+  </section>
+
+  <section>
+    <h2>Bismillahirrahmanirrahim</h2><svg class="dv" viewBox="0 0 200 14" aria-hidden="true"><use href="#dv"></use></svg>
+    <p class="quote" data-k="quote">Di antara tanda-tanda kekuasaan-Nya ialah Dia menciptakan pasangan untukmu agar kamu merasa tenteram kepadanya, dan Dia menjadikan di antaramu rasa kasih dan sayang.</p>
+  </section>
+
+  <section>
+    <div class="photo" id="ph" style="background-image: none;"></div>
+    <p class="who" data-k="g">Aku</p>
+    <p class="par">Putra dari <span data-k="gp">Bapak A &amp; Ibu A</span></p>
+    <div class="amp">&amp;</div>
+    <p class="who" data-k="b">Kamu</p>
+    <p class="par">Putri dari <span data-k="bp">Bapak S &amp; Ibu S</span></p>
+  </section>
+
+  <section>
+    <h2>Acara Pernikahan</h2><svg class="dv" viewBox="0 0 200 14" aria-hidden="true"><use href="#dv"></use></svg>
+    <p class="date" data-d="long">Selasa, 29 Juni 2032</p>
+    <div class="cards">
+      <div class="card"><h3>Akad Nikah</h3><p class="t" data-k="akadT">Pukul 08.00 WIB</p><p data-k="akadP">Masjid Al-Ikhlas</p></div>
+      <div class="card"><h3>Resepsi</h3><p class="t" data-k="resT">Pukul 11.00 - 14.00 WIB</p><p data-k="resP">Hotels South Sumatera</p></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Lokasi</h2><svg class="dv" viewBox="0 0 200 14" aria-hidden="true"><use href="#dv"></use></svg>
+    <p data-k="addr" style="margin-bottom:22px">Jl. Raya Contoh No. 12, Bekasi, Jawa Barat</p>
+    <a class="btn" id="mapBtn" target="_blank" rel="noopener" href="https://maps.google.com/?q=Bekasi">Buka Google Maps</a>
+  </section>
+
+  <section id="rsvp">
+    <h2>Konfirmasi Kehadiran</h2><svg class="dv" viewBox="0 0 200 14" aria-hidden="true"><use href="#dv"></use></svg>
+    <p>Mohon konfirmasi kehadiran Anda melalui WhatsApp.</p>
+    <form id="rf">
+      <div><label for="rn">Nama</label><input id="rn" placeholder="Nama Anda" required=""></div>
+      <div><label for="rs">Kehadiran</label><select id="rs"><option>Hadir</option><option>Tidak hadir</option><option>Masih ragu</option></select></div>
+      <div><label for="rj">Jumlah tamu</label><input id="rj" type="number" min="1" value="1"></div>
+      <div><label for="ru">Ucapan dan doa</label><textarea id="ru" rows="3" placeholder="Tulis ucapan (opsional)"></textarea></div>
+      <button class="btn" type="submit">Kirim lewat WhatsApp</button>
+    </form>
+  </section>
+
+  <footer>
+    <p class="quote" data-k="bless">Merupakan kebahagiaan bagi kami apabila Bapak/Ibu/Saudara/i berkenan hadir dan memberikan doa restu. Terima kasih.</p>
+    <p class="who" style="margin-top:14px"><span data-k="g">Aku</span> &amp; <span data-k="b">Kamu</span></p>
+  </footer>
+</main>
+
+<button class="fab" id="mus" title="Putar atau hentikan musik" aria-label="Musik">♫</button>
+<button class="fab" id="edb" title="Edit undangan" aria-label="Edit">✎</button>
+
+<aside id="ed" aria-label="Editor undangan" class="">
+  <button class="x" id="edx" aria-label="Tutup">×</button>
+  <h4>Editor undangan</h4>
+  <p class="hint">Perubahan langsung tampil. Klik Simpan untuk mengunduh undangan sebagai file HTML.</p>
+  <div id="fields"><label for="f_g">Nama mempelai pria</label><input id="f_g" type="text"><label for="f_b">Nama mempelai wanita</label><input id="f_b" type="text"><label for="f_gp">Orang tua mempelai pria</label><textarea id="f_gp"></textarea><label for="f_bp">Orang tua mempelai wanita</label><textarea id="f_bp"></textarea><label for="f_date">Tanggal acara</label><input id="f_date" type="date"><label for="f_akadT">Jam akad</label><input id="f_akadT" type="text"><label for="f_akadP">Tempat akad</label><input id="f_akadP" type="text"><label for="f_resT">Jam resepsi</label><input id="f_resT" type="text"><label for="f_resP">Tempat resepsi</label><input id="f_resP" type="text"><label for="f_addr">Alamat lengkap</label><textarea id="f_addr"></textarea><label for="f_maps">Link Google Maps</label><input id="f_maps" type="text"><label for="f_wa">Nomor WhatsApp (format 628...)</label><input id="f_wa" type="text"><label for="f_quote">Kutipan pembuka</label><textarea id="f_quote"></textarea><label for="f_bless">Kata penutup</label><textarea id="f_bless"></textarea><label for="f_music">Link musik MP3 (kosong = musik bawaan)</label><input id="f_music" type="text"></div>
+  <div class="row">
+    <div><label>Warna aksen</label><input type="color" data-c="pri"></div>
+    <div><label>Warna latar</label><input type="color" data-c="bg"></div>
+    <div><label>Warna teks</label><input type="color" data-c="txt"></div>
+  </div>
+  <label>Foto sampul</label><input type="file" accept="image/*" data-p="cover">
+  <label>Foto mempelai</label><input type="file" accept="image/*" data-p="photo">
+  <p style="margin-top:6px"><button class="btn ghost" style="padding:4px 12px;font-size:12px" id="clr">Hapus foto</button></p>
+  <div class="sv"><button id="save">Simpan HTML</button><button class="o" id="rst">Atur ulang</button></div>
+  <div id="msg"></div>
+</aside>
+
+<script type="application/json" id="cfg">{"g":"Aku","b":"Kamu","gp":"Bapak A & Ibu A","bp":"Bapak S & Ibu S","date":"2032-06-29","akadT":"Pukul 08.00 WIB","akadP":"Masjid Al-Ikhlas","resT":"Pukul 11.00 - 14.00 WIB","resP":"Hotels South Sumatera","addr":"Jl. Raya Contoh No. 12, Bekasi, Jawa Barat","maps":"https://maps.google.com/?q=Bekasi","wa":"082365764832","quote":"Di antara tanda-tanda kekuasaan-Nya ialah Dia menciptakan pasangan untukmu agar kamu merasa tenteram kepadanya, dan Dia menjadikan di antaramu rasa kasih dan sayang.","bless":"Merupakan kebahagiaan bagi kami apabila Bapak/Ibu/Saudara/i berkenan hadir dan memberikan doa restu. Terima kasih.","music":"","pri":"#c9a45c","bg":"#fbf7f4","txt":"#3a2c33","cover":"","photo":""}</script>
+
+<script>
+const $=s=>document.querySelector(s),$$=s=>[...document.querySelectorAll(s)];
+const DEF=JSON.parse($('#cfg').textContent);
+let C=Object.assign({},DEF);
+const F=[['g','Nama mempelai pria'],['b','Nama mempelai wanita'],['gp','Orang tua mempelai pria','a'],['bp','Orang tua mempelai wanita','a'],['date','Tanggal acara','date'],['akadT','Jam akad'],['akadP','Tempat akad'],['resT','Jam resepsi'],['resP','Tempat resepsi'],['addr','Alamat lengkap','a'],['maps','Link Google Maps'],['wa','Nomor WhatsApp (format 628...)'],['quote','Kutipan pembuka','a'],['bless','Kata penutup','a'],['music','Link musik MP3 (kosong = musik bawaan)']];
+const fmt=(o)=>{const d=new Date(C.date+'T00:00:00');return isNaN(d)?C.date:d.toLocaleDateString('id-ID',o)};
+function render(){
+  const r=document.documentElement.style;['pri','bg','txt'].forEach(k=>r.setProperty('--'+k,C[k]));
+  $$('[data-k]').forEach(e=>e.textContent=C[e.dataset.k]);
+  $$('[data-i]').forEach(e=>e.textContent=(C[e.dataset.i]||'?').trim()[0].toUpperCase());
+  $$('[data-d]').forEach(e=>e.textContent=fmt(e.dataset.d=='long'?{weekday:'long',day:'numeric',month:'long',year:'numeric'}:{day:'2-digit',month:'2-digit',year:'numeric'}).replace(/\//g,'.'));
+  $('#cover').style.backgroundImage=C.cover?`url(${C.cover})`:'';
+  $('#hero').style.backgroundImage=C.cover?`url(${C.cover})`:'';
+  const p=$('#ph');p.classList.toggle('has',!!C.photo);p.style.backgroundImage=C.photo?`url(${C.photo})`:'none';
+  $('#mapBtn').href=C.maps||('https://www.google.com/maps/search/?api=1&query='+encodeURIComponent(C.addr));
+  document.title='Undangan Pernikahan '+C.g+' & '+C.b;
+  tick();
+}
+function tick(){
+  const t=new Date(C.date+'T08:00:00')-new Date(),el=$('#cd');
+  if(isNaN(t)){el.innerHTML='';return}
+  if(t<0){el.innerHTML='<p>Alhamdulillah, acara telah berlangsung</p>';return}
+  const v=[['Hari',864e5],['Jam',36e5],['Menit',6e4],['Detik',1e3]];let x=t;
+  el.innerHTML=v.map(([n,m])=>{const q=Math.floor(x/m);x-=q*m;return `<div><b>${q}</b><span>${n}</span></div>`}).join('');
+}
+setInterval(tick,1000);
+// tamu: ?to=Nama
+const to=new URLSearchParams(location.search).get('to');if(to)$('#guest').textContent=to;
+// buka undangan
+$('#openBtn').onclick=()=>{$('#cover').classList.add('open');document.body.classList.remove('lock');document.body.classList.add('ready');window.scrollTo(0,0);play()};
+// musik
+let ac,timer,aud,on=false,mg,step=0,nxt=0;
+const CH=[[261.63,329.63,392],[220,261.63,329.63],[174.61,220,261.63],[196,246.94,293.66]],PT=[0,1,2,1,2,1,2,1];
+function note(f,t){const o=ac.createOscillator(),g=ac.createGain();o.type='triangle';o.frequency.value=f;g.gain.setValueAtTime(.0001,t);g.gain.exponentialRampToValueAtTime(.22,t+.03);g.gain.exponentialRampToValueAtTime(.0001,t+2.2);o.connect(g);g.connect(mg);o.start(t);o.stop(t+2.3)}
+function synth(){
+  if(!ac){ac=new (window.AudioContext||window.webkitAudioContext)();mg=ac.createGain();mg.gain.value=.4;const d=ac.createDelay(),fb=ac.createGain();d.delayTime.value=.42;fb.gain.value=.45;mg.connect(ac.destination);mg.connect(d);d.connect(fb);fb.connect(d);d.connect(ac.destination);nxt=ac.currentTime+.1}
+  ac.resume();clearInterval(timer);
+  timer=setInterval(()=>{while(nxt<ac.currentTime+.6){const c=CH[Math.floor(step/8)%4],i=step%8;note(c[PT[i]]*(i==0?.5:1),nxt);step++;nxt+=.62}},120);
+}
+function play(){
+  try{
+    if(C.music){if(!aud||aud.src!==C.music){aud=new Audio(C.music);aud.loop=true}aud.play().catch(()=>{})}
+    else synth();
+    on=true;document.body.classList.add('playing')
+  }catch(e){}
+}
+function stop(){clearInterval(timer);if(ac)ac.suspend();if(aud)aud.pause();on=false;document.body.classList.remove('playing')}
+$('#mus').onclick=()=>on?stop():play();
+// RSVP
+$('#rf').onsubmit=e=>{
+  e.preventDefault();
+  let n=(C.wa||'').replace(/\D/g,'');if(n.startsWith('0'))n='62'+n.slice(1);
+  const s=$('#rs').value,u=$('#ru').value.trim();
+  const m=`Assalamualaikum, saya ${$('#rn').value} ingin mengonfirmasi: ${s} (${$('#rj').value} orang) pada pernikahan ${C.g} & ${C.b}, ${fmt({day:'numeric',month:'long',year:'numeric'})}.`+(u?`\nUcapan: ${u}`:'');
+  window.open(`https://wa.me/${n}?text=${encodeURIComponent(m)}`,'_blank');
+};
+// editor
+const fh=$('#fields');
+F.forEach(([k,l,t])=>{
+  const lb=document.createElement('label');lb.textContent=l;lb.htmlFor='f_'+k;
+  const i=document.createElement(t=='a'?'textarea':'input');i.id='f_'+k;if(t!='a')i.type=t=='date'?'date':'text';
+  i.value=C[k];i.oninput=()=>{C[k]=i.value;render()};fh.append(lb,i);
+});
+$$('[data-c]').forEach(i=>{i.value=C[i.dataset.c];i.oninput=()=>{C[i.dataset.c]=i.value;render()}});
+$$('[data-p]').forEach(i=>i.onchange=()=>{
+  const f=i.files[0];if(!f)return;const rd=new FileReader();
+  rd.onload=()=>{const im=new Image();im.onload=()=>{const s=Math.min(1,1000/Math.max(im.width,im.height)),cv=document.createElement('canvas');cv.width=im.width*s;cv.height=im.height*s;cv.getContext('2d').drawImage(im,0,0,cv.width,cv.height);C[i.dataset.p]=cv.toDataURL('image/jpeg',.8);render()};im.src=rd.result};
+  rd.readAsDataURL(f);
+});
+$('#clr').onclick=()=>{C.cover='';C.photo='';render()};
+$('#edb').onclick=()=>$('#ed').classList.add('on');
+$('#edx').onclick=()=>$('#ed').classList.remove('on');
+$('#rst').onclick=()=>{if(!confirm('Kembalikan semua isi ke contoh awal?'))return;C=Object.assign({},DEF);F.forEach(([k])=>$('#f_'+k).value=C[k]);$$('[data-c]').forEach(i=>i.value=C[i.dataset.c]);render()};
+$('#save').onclick=()=>{
+  const d=document.documentElement.cloneNode(true);
+  d.querySelector('#cfg').textContent=JSON.stringify(C).replace(/</g,'\\u003c');
+  d.querySelector('body').setAttribute('data-mode','view');d.querySelector('body').className='lock';
+  d.querySelector('#cover').className='';d.querySelector('#ed').className='';
+  const h='<!DOCTYPE html>\n'+d.outerHTML;
+  const a=document.createElement('a');
+  a.href=URL.createObjectURL(new Blob([h],{type:'text/html'}));
+  a.download='undangan-'+(C.g+'-'+C.b).toLowerCase().replace(/[^a-z0-9]+/g,'-')+'.html';
+  document.body.append(a);a.click();a.remove();
+  $('#msg').textContent='Tersimpan. Cek folder Unduhan Anda.';
+};
+(function(){const w=$('#cover');for(let i=0;i<14;i++){const p=document.createElement('i');p.className='pt';p.style.cssText=`left:${Math.random()*100}%;width:${8+Math.random()*9}px;height:${10+Math.random()*10}px;animation-duration:${9+Math.random()*9}s;animation-delay:${-Math.random()*14}s`;w.prepend(p)}})();
+render();
+</script>
+
+
+</body></html>
